@@ -1,0 +1,36 @@
+monetization:
+    - daeva
+    - pass
+    - candies
+    - p2w
+    - shop
+    - buy
+    - subscription
+localization:
+    - eu
+    - na
+    - us
+    - servers
+    - times
+    - time
+gameplay:
+    - level
+    - gear
+    - pvp
+    - ap
+    - coins
+    - siege
+    - game
+faction:
+    - siel
+    - israphel
+    - elyos
+    - asmo
+    - asmodian
+events:
+    - sponsor
+    - contest
+    - entry
+    - event
+    - rules
+    - official

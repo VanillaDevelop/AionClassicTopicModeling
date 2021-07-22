@@ -1,0 +1,388 @@
+---
+title: "Aion Online Topic Modelling"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+## About
+
+When talking about MMORPG (massive multiplayer online role playing game)
+communities, a hot point of contention between the western and eastern
+markets is often the form of monetization. While Chinese and Korean
+markets generally prefer free to play titles with the addition of
+microtransactions, which often factor directly into gameplay, western
+markets often do not appreciate the ability to obtain an advantage using
+real life currency, and instead prefer games with an upfront cost (buy
+to play) or subscription (pay to play), which does not offer said
+advantages.
+
+This clash of ideologies came to a head on the 23rd of June, when the
+2009 hit MMORPG Aion was re-released as a classic version in the west.
+Rather than replicating its original service model of a purchasable game
+with an added monthly subscription of \$15, this new version allows a
+daily free-to-play experience of 1 hour with no upfront cost, after
+which a subscription of \$15 is all but required to efficiently progress
+in the game.
+
+However, on top of this new model, a \$30 monthly "battle pass", which
+offers exclusive rewards including minor boosts to the gameplay
+experience was made available, as well as MTX items dubbed "candies" by
+the community, which are sellable to NPC vendors for a rather large sum,
+effectively generating large amounts of ingame currency out of thin air.
+
+This report aims to outline the public response to these changes. A corresponding write-up can be found on my
+website, [vanilla-dev.online](https://vanilla-dev.online/mtx-perception-aion-classic/).
+
+The libraries below must be installed and included to re-run the code.
+
+```{r, warning=FALSE}
+library('rvest')
+library('Rcpp')
+library('stringr')
+library('quanteda')
+library('quanteda.textstats')
+library('quanteda.textplots')
+library('seededlda')
+library('purrr')
+library('dplyr')
+library('ggplot2')
+library('reshape2')
+library('lubridate')
+```
+
+### Scraping data
+
+Data is scraped from the official Aion Classic forums, using rvest. To
+do this, a function is first defined which loads all thread names and
+URLs from a single page of the Aion forums.
+
+```{r}
+# the base URL for aion classic general discussion
+url <- 'https://forums.aiononline.com/forum/28-general-discussion/page/'
+```
+
+```{r}
+# define a function which gets all topic titles and URL from the aion classic general discussion forum
+get_links <- function(webpage) {
+  threads <- html_nodes(webpage, '.ipsDataItem_title') %>% html_node('a')
+  thread_dframe <- data.frame(threads %>% html_text() %>% str_replace_all("[\r\n\t]", ""), threads %>% html_attr('href'))
+  names(thread_dframe) <- c("Title", "URL")
+  return(thread_dframe)
+}
+```
+
+```{r}
+# example usage
+webpage <- read_html(paste(url, 1))
+head(get_links(webpage), 5)
+```
+
+This function now has to be applied to every page and the results
+concatenated into a single data frame.
+
+```{r, eval=FALSE, echo=TRUE}
+df <- read_html(paste(url, 1)) %>% get_links()
+#has to be increased if number of pages goes over 100 - very unlikely at the moment
+for (i in 2:100)
+{
+  webpage <- read_html(paste(url, i))
+  #if number of pages is exceeded, pageno will be "1" and will not match up with the active index
+  pageno <- html_node(webpage, '.ipsPagination_page.ipsPagination_active a') %>% html_text()
+  if(toString(i) != pageno)
+  {
+    break
+  }
+  df <- rbind(df, get_links(webpage))
+}
+```
+
+```{r}
+# Check the last couple entries
+tail(df, 5)
+```
+
+After scraping every forum thread, the next step is to extract the text
+from all posts. This is a bit more difficult, because several edge cases
+need to be considered:  
+- The date stamp should be extracted  
+- The username should be extracted  
+- Quoted text should be ignored (as this would lead to an incorrect weighting of words)  
+- Images should be ignored  
+- Name tags (@username) should be extracted as their base string form  
+- Threads with multiple pages of discussions should consider each page 
+
+This first function reads all posts from a single page of an Aion forum
+discussion thread, including metadata.
+
+```{r}
+get_posts <- function(webpage)
+{
+  #create empty data frame
+  df <- data.frame(Name=character(), Date=character(), Text=character())
+  posts <- html_nodes(webpage, 'article')
+  for(post in posts)
+  {
+    #extract name
+    name <- post %>% html_node('.cAuthorPane_author') %>% html_text2()
+    #extract date
+    date <- post %>% html_node('.ipsType_reset a time') %>% html_text2()
+    #extract texts
+    texts <- post %>% html_nodes(xpath='.//div[@class="cPost_contentWrap"]/div[1]/p') %>% html_text2()
+    #remove posts which have no texts
+    texts = texts[str_replace_all(texts, " ", "") != ""]
+    #create data frame replicating the name and date to the amount of texts leftover
+    df <- rbind(df, data.frame(Name=rep(name,length(texts)), Date=rep(date,length(texts)), Text=texts))
+  }
+  return(df)
+}
+```
+
+This function must now be called on all pages of a discussion. Much like
+the forum iteration itself, we can achieve pagination by simply
+appending /page/n to the forum id, and checking if the active pagination
+number matches up.
+
+```{r}
+get_all_posts <- function(page_link)
+{
+  #get first page, see if thread is multipage
+  webpage <- read_html(paste(page_link, 1))
+  df <- webpage %>% get_posts()
+  #return df directly if there is only 1 page
+  if(is.na(html_node(webpage, '.ipsPagination_page.ipsPagination_active a')))
+    return(df)
+  #enter max page to scrape here
+  for (i in 2:30)
+  {
+    webpage <- read_html(paste(page_link, i))
+    #if number of pages is exceeded, pageno will be "1" and will not match up with the active index
+    pageno <- html_node(webpage, '.ipsPagination_page.ipsPagination_active a') %>% html_text()
+    if(toString(i) != pageno)
+    {
+      break
+    }
+    df <- rbind(df, get_posts(webpage))
+  }
+  return(df)
+}
+```
+
+In order to scrape the entire forum, this function needs to now be
+called for every thread in the original list of threads. We can append
+the thread name and link to every paragraph, as this can be used later
+in the document feature matrix as a document level variable.
+
+```{r, eval=FALSE, echo=TRUE}
+#setup empty data frame
+text_data <- data.frame(Thread=character(), URL=character(), Name=character(), Date=character(), Text=character()) 
+#iterate over the number of rows in the data frame
+nthreads = nrow(df)
+for(j in 1:nthreads)
+{
+  if(j %% 10 == 0) print(paste("Scraping thread", j, "of", nthreads))
+  thread_df = get_all_posts(paste(df[j,2]))
+  thread_df$Thread = rep(df[j,1], nrow(thread_df))
+  thread_df$URL = rep(df[j,2], nrow(thread_df))
+  text_data <- rbind(text_data, thread_df)
+  
+  if(j %% 150 == 0 && j > 0)
+  {
+    #Sleep for 10 minutes. prevents cloudflare from acting up about web scraping and eventually throwing a 403 error
+    Sys.sleep(60*10)
+  }
+}
+```
+
+Finally, in order to properly group these data values by date, the
+timestamps of all dates within the last 7 days needs to be adjusted to
+fit one consistent date format. **This code needs to be changed if
+you choose to re-scrape the forums.**
+
+```{r}
+#Get all unique date values
+unique(map_chr(text_data$Date[order(text_data$Date)], function(x) substr(x, 1, 9)))
+```
+
+It can be seen here, that values are present from June 9 (earliest) to
+July 9 (latest). As we can see that July 9, 2021 is a Friday, this means
+all values starting with Saturday need to be mapped to July 10, Sunday
+to July 11, etc.If you choose to re-run the scraping, you will have to
+adapt these values to your last present values.
+
+```{r}
+mapDate <- function(string)
+{
+  if (startsWith(string, "Saturday")) return("July 10")
+  if (startsWith(string, "Sunday")) return("July 11")
+  if (startsWith(string, "Monday")) return("July 12")
+  if (startsWith(string, "Tuesday")) return("July 13")
+  if (startsWith(string, "yesterday")) return("July 14")
+  if (!startsWith(string, "June") && !startsWith(string, "July")) return("July 15")
+  return(string)
+}
+```
+
+Replace the outlier values to get properly formatted dates
+
+```{r}
+text_data$Date = map_chr(text_data$Date, mapDate)
+unique(text_data$Date)
+```
+
+After scraping, this data frame can be stored to file
+
+```{r}
+save(text_data, file="texts.Rda")
+```
+
+And loaded again, if necessary
+
+```{r}
+load("texts.Rda")
+```
+
+### Data Analysis
+
+For processing of data, quanteda is used, which is a very powerful
+library for text analysis. First, a corpus, list of tokens, and finally
+a document feature matrix should be created.
+
+```{r}
+#construct a quanteda corpus
+corp <- corpus(text_data, text_field="Text")
+summary(corp, 5)
+ndoc(corp)
+```
+
+```{r}
+#tokenization
+toks <- tokens(corp)
+#filtering of stop words and single character words
+toks <- tokens_select(toks, pattern = stopwords("en"), selection="remove")
+toks <- tokens_select(toks, min_nchar = 2)
+```
+
+```{r}
+#creation of a document-feature matrix
+dfmat <- dfm(toks)
+#this allows the first analysis - the most frequent features (tokens) in the forums
+topfeatures(dfmat, 20)
+```
+
+Some simple visualization can now be done using wordclouds.
+
+```{r}
+#creation of a wordcloud
+textplot_wordcloud(dfmat, max_words=100, min_count=10)
+```
+
+```{r}
+#creation of a DFM for bigrams
+tok_bigrams <- tokens_ngrams(toks, n = 2)
+dfmat_bigrams <- dfm(tok_bigrams)
+```
+
+```{r}
+#bigram wordcloud
+textplot_wordcloud(dfmat_bigrams, max_words=50, min_count=10)
+```
+
+Using a feature co-occurrence matrix, we can build a semantic network
+and see words commonly used together.
+
+```{r}
+#creation of a feature co-occurrence matrix
+fcmat <- fcm(dfmat)
+#find the top 30 features
+feats <- names(topfeatures(fcmat, 30))
+#visualize a semantic network of the top 30 features
+size <- log(colSums(dfm_select(dfmat, feats, selection = "keep")))
+fcm_select(fcmat, pattern = feats) %>% textplot_network(min_freq = 0.8, vertex_size = size / max(size) * 3)
+```
+
+The two words "just" and "players" may be interesting contextually, so
+we can find the words that they co-occurr mostly with.
+
+```{r}
+tail(fcmat[order(fcmat[, "just"]), "just"], 10)
+```
+
+```{r}
+tail(fcmat[order(fcmat[, "players"]), "players"], 10)
+```
+
+LDA can be used to discover topics within the texts. This can first be
+ran unseeded (i.e. unsupervised)
+
+```{r}
+# perform (unseeded) LDA (topic detection)
+tmod_lda <- textmodel_lda(dfmat, k = 10)
+```
+
+```{r}
+terms(tmod_lda, 10)
+```
+
+The (unseeded) LDA provides some interesting ideas for topics. Most
+topics do in fact correspond to an actual topic of discussion, such as
+the monetization, candy economy, locale of the servers, etc. **Without setting a 
+random seed, it is possible that the specific words and topic order changes.**
+
+To slightly improve these topics, we can use "seeded LDA", providing
+predetermined topics and some seed words from a dictionary.
+
+```{r}
+dict_topic <- dictionary(file = "./topic_dict.yml")
+print(dict_topic)
+```
+
+```{r}
+tmod_slda <- textmodel_seededlda(dfmat, dictionary = dict_topic)
+terms(tmod_slda, 10)
+```
+
+We can now assign each "paragraph" of text the most likely topic, and
+plot relative and absolute topic counts.
+
+```{r}
+head(topics(tmod_slda), 20)
+```
+
+```{r}
+dfmat$topic <- topics(tmod_slda)
+table(dfmat$topic)
+```
+
+```{r}
+dfm_dataframe <- data.frame(Date=dfmat$Date, topic=dfmat$topic)
+```
+
+```{r}
+dfmcnt <- dfm_dataframe %>% count(Date, topic)
+dfmcnt$Dateval <- as.Date(dfmcnt$Date,format="%B %d")
+```
+
+```{r}
+plotdata <- data.frame(dfmcnt$Dateval, dfmcnt$topic, dfmcnt$n)
+ggplot(plotdata, aes(fill=dfmcnt$topic, y=dfmcnt$n, x=dfmcnt$Dateval)) + geom_bar(position="fill", stat="identity") + xlab("Date") + ylab("Relative topic distribution") + labs(fill="Topic")
+ggplot(plotdata, aes(fill=dfmcnt$topic, y=dfmcnt$n, x=dfmcnt$Dateval)) + geom_bar(position="stack", stat="identity") + xlab("Date") + ylab("Number of paragraphs") + labs(fill="Topic")
+```
+
+Finally, using keyness, we can plot the relative frequency of words
+within a specific window (here, one week leading up to and after the
+release) in comparison to all other posts.
+
+```{r}
+dfmat$Dateval <- as.Date(dfmat$Date,format="%B %d")
+tstat_key <- textstat_keyness(dfmat, target = (dfmat$Dateval >= ymd("2021-06-15")) & dfmat$Dateval <= ymd("2021-06-29"))
+```
+
+```{r}
+textplot_keyness(tstat_key, n=20, labelsize=3, min_count=50)
+```
