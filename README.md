@@ -2,7 +2,7 @@
 
 This project uses rvest to mine text data from the [Aion Classic General Discussion Forums](https://forums.aiononline.com/forum/28-general-discussion/) and quanteda to visualize results. 
 
-See the [writeup on my website](https://vanilla-dev.online/general/project-update/) or the [Dataset I have provided on Kaggle](https://www.kaggle.com/vanilladev/aion-classic-general-discussion-forum-posts) if you just want to use existing data.
+See the [writeup on my website](https://vanilla-dev.online/mtx-perception-aion-classic/) or the [Dataset I have provided on Kaggle](https://www.kaggle.com/vanilladev/aion-classic-general-discussion-forum-posts) if you just want to use existing data.
 
 This project is written using R Markdown (.rmd) - you will need an environment which can recognize these files to work with it. I recommend RStudio.
 
